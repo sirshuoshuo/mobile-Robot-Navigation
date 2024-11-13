@@ -3,129 +3,117 @@ import rospy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 import math
-import numpy as np
+
 
 class HuskyHighlevelController:
-    def __init__(self, nh):
-        self.p_ang = 0.5  # 控制角速度的比例增益
-        self.warning_count = 0
-        self.num = 0
+    def __init__(self):
+        rospy.init_node('husky_highlevel_controller', anonymous=True)
+        self.p_ang = 1.0  
+        self.fixed_velocity = 0.3  
 
-        self.subscriber = rospy.Subscriber("/scan", LaserScan, self.LaserCallback)
-        self.vel_pub = rospy.Publisher("/cmd_vel", Twist,queue_size=1)
+        self.subscriber = rospy.Subscriber("/scan", LaserScan, self.laser_callback)
+        self.vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+
         self.msg = Twist()
 
-    def setVel(self, vel, dof):
+        # 目标位置和距离
+        self.target_distance = None
+        self.target_angle = None
+
+        self.goal_reached = False  # 
+
+    def set_vel(self, vel, dof):
+        
         if dof == "forward":
-            self.msg.linear.x = vel  # 设置线速度
+            self.msg.linear.x = vel
         elif dof == "ang":
-            self.msg.angular.z = vel  # 设置角速度
+            self.msg.angular.z = vel
 
-    def adjustSpeed(self, dist):
-        # 调整机器人的前进速度，基于激光测得的距离使用比例控制（P 控制）
-        vel = 1 * (dist - 0.15)  # 距离小于 0.16 米时停止
-        if vel > 5.0:
-            vel = 5.0  # 速度上限
-        elif vel < 0.0:
-            vel = 0.0  # 速度下限，停止前进
-
-        self.setVel(vel, "forward")  # 设置调整后的线速度
-        self.DriveHusky()  # 发布新的速度命令
-
-
-    def adjustHeading(self, target_ang):
-        angle_threshold = 0.05  # 设置阈值为 0.05 弧度（约 3度），你可以根据需要调整
-
-        # 如果目标角度接近零，即机器人已经对准目标角度，停止旋转
-        if abs(target_ang) < angle_threshold:
-            self.setVel(0.0, "ang")  # 停止角速度
-        else:
-            # 否则，根据目标角度调整角速度（使用比例控制）
-            self.setVel(self.p_ang * target_ang, "ang")
-
-        self.DriveHusky()  # 发布新的速度命令
-
-    def find_local_minimum_points(self, msg):
-        # 设置距离的范围 1.0m 到 1.25m
-        min_dist = 0.95
-        max_dist = 1.35
-        threshold = 2.5  # 周围的距离阈值，大于2.5m
-        target_points = []  # 用于存储符合条件的目标点
+    def publish_velocity(self):
         
-        distancd = None
-        ang = None
-        i = 1
-        while i < len(msg.ranges) - 1:  # 避免越界，检查前后点
-            # 如果当前点的距离在 1.0 到 1.25 米之间，开始检查连续点
-            if min_dist <= msg.ranges[i] <= max_dist:
-                start = i  # 记录符合条件的连续段的开始位置
-                # 检查后续点，确保这些点在 1.0m 到 1.25m 之间
-                while i < len(msg.ranges) - 1 and min_dist <= msg.ranges[i] <= max_dist:
-                    i += 1
-                end = i  # 连续段的结束位置
-                
-                # 检查连续段前后的点是否大于阈值，确保这段是局部最小
-                if start > 0 and end < len(msg.ranges) and msg.ranges[start - 1] > threshold and msg.ranges[end] > threshold:
-                    # 如果符合条件，将连续段的角度和距离添加到目标点列表
-                        distancd = msg.ranges[start+1]
-                        ang = msg.angle_min + msg.angle_increment * (start+1)  # 计算每个点的角度
-                        break
-                        
-            # 继续遍历下一个点
-            i += 1
-        if distancd is not None and ang is not None:
-            self.warning_count = 0
-        if distancd is None or ang is None:
-            self.warning_count += 1
-            rospy.logwarn("No valid local minimum point found.")
-            distancd = 0.0  # 默认值
-            ang = 0.0  # 默认值
-        return distancd,ang
-    def find_min_distance_above_threshold(self, msg, threshold=0.05):
-        # 筛选出大于 0.05 的所有有效距离
-        valid_distances = [d for d in msg.ranges if d > threshold]
-
-        if valid_distances:
-            # 找到最小距离
-            min_distance = min(valid_distances)
-            return min_distance
-
-    def DriveHusky(self):
-        # 发布速度命令，控制 Husky 机器人运动
         self.vel_pub.publish(self.msg)
-    
-    def LaserCallback(self, msg):
-        dist,ang = self.find_local_minimum_points(msg)
-        min_dis =self.find_min_distance_above_threshold(msg)
-        rospy.loginfo("Object is %.2f meters away at %.2f degrees", dist, ang * 180.0 / math.pi)  # 打印物体的位置
+
+    def adjust_speed(self, dist):
         
-        if self.warning_count >= 10:
-            self.adjustHeading(0.0)
+        vel = 0.0 if dist <= 0.15 else self.fixed_velocity
+        self.set_vel(vel, "forward")
+
+    def adjust_heading(self, ang):
+        
+        self.set_vel(-ang, "ang")
+
+    def laser_callback(self, msg):
+        
+       
+        valid_ranges = [r for r in msg.ranges if r > 0]
+        valid_indices = [i for i, r in enumerate(msg.ranges) if r > 0]
+
+        # 突变点
+        mutation_points = self.find_mutation_points(valid_ranges)
+
+        if mutation_points and not self.goal_reached:
+            # 转向角度和移动距离
+            target_angle, target_distance = self.calculate_target_angle_and_distance(mutation_points, valid_indices, msg)
+            self.target_angle = target_angle
+            self.target_distance = target_distance
+            self.adjust_heading(target_angle)
+            self.adjust_speed(target_distance - 0.15)  
+            self.publish_velocity()
+
+           
+            if self.target_distance <= 0.:
+                self.set_vel(0.0, "forward")  
+                self.set_vel(0.0, "ang")  
+                self.publish_velocity()
+
+                rospy.loginfo(f"已到达目标位置，目标距离：{self.target_distance}m")
+                self.goal_reached = True  
+
+        elif self.goal_reached:
+            
+            rospy.loginfo("已经到达目标位置，停止运动。")
+
+    def find_mutation_points(self, ranges):
+        
+        mutation_points = []
+        for i in range(1, len(ranges) - 1):
+            if abs(ranges[i] - ranges[i - 1]) > 1:  # 差值是否大于1米
+                mutation_points.append(i)
+        return mutation_points
+
+    def calculate_target_angle_and_distance(self, mutation_points, valid_indices, msg):
+        
+        angles = []
+        distances = []
+
+        # 突变点
+        close_mutations = []
+
+        for i in range(1, len(mutation_points)):
+            idx1 = mutation_points[i - 1]
+            idx2 = mutation_points[i]
+            
+            
+            if abs(valid_indices[idx2] - valid_indices[idx1]) < 5:  
+                
+                avg_angle = (msg.angle_min + idx1 * msg.angle_increment + msg.angle_min + idx2 * msg.angle_increment) / 2
+                avg_distance = (msg.ranges[valid_indices[idx1]] + msg.ranges[valid_indices[idx2]]) / 2
+                close_mutations.append((avg_angle, avg_distance))
+            else:
+                angles.append(msg.angle_min + idx1 * msg.angle_increment)
+                distances.append(msg.ranges[valid_indices[idx1]])
+
+        # 选择平均值
+        if close_mutations:
+            avg_angle = sum([m[0] for m in close_mutations]) / len(close_mutations)
+            avg_distance = sum([m[1] for m in close_mutations]) / len(close_mutations)
+            return avg_angle, avg_distance
         else:
-            self.msg.linear.x=0.0
-            self.adjustHeading(ang)
+            return angles[0], distances[0]
 
+if __name__ == '__main__':
+    controller = HuskyHighlevelController()
+    rate = rospy.Rate(10)  
 
-        if self.warning_count >= 10 and self.num==1:
-            rospy.loginfo("min distance is %.2f meter",min_dis)
-            self.adjustSpeed(min_dis)
-
-        if self.warning_count >= 10 and self.num==0:
-            self.msg.linear.x = 1.0  # 设置线速
-            self.DriveHusky()
-            rospy.sleep(0.1)  # 延迟 2 秒，模拟机器人行驶 2 秒
-            self.msg.linear.x = 0.0  # 设置前进速度为 0
-            self.DriveHusky()  # 停止机器人
-            self.num=1
-
-if __name__ == "__main__":
-    # 初始化 ROS 节点
-    rospy.init_node("speed_controller")
-
-    # 实例化控制器对象
-    controller = HuskyHighlevelController(rospy)
-
-    # 保持节点运行
-    rospy.spin()
-
-        
+    while not rospy.is_shutdown():
+        rate.sleep()
